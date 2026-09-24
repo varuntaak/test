@@ -1,396 +1,445 @@
-import { createWidget, widget, align, text_style, prop } from '@zos/ui'
-import { Geolocation, Compass, Vibrator, VIBRATOR_SCENE_DURATION } from '@zos/sensor'
-import { localStorage } from '@zos/storage'
+// TrackBack for Zepp OS (Amazfit Active Max) — API_LEVEL 3.0+
+// Replace page/index.js of a project created with `zeus create`.
+//
+// Buttons (Garmin-style):
+//   START  : start recording -> stop recording -> start TrackBack -> end TrackBack
+//   BACK   : (idle) exit app  | (stopped) resume recording | (TrackBack) end TrackBack
+//   HOLD BACK while stopped   : discard route and start fresh
+//
+// Screen: north-up map. Green = your route, blue dot = start,
+// white dot = you. In TrackBack the route turns grey, the part still
+// to walk is orange, and you become an arrow pointing to the next waypoint.
+//
+// app.json -> "permissions" must include:
+//   "device:os.geolocation", "device:os.compass", "device:os.local_storage"
+
+import { createWidget, widget, align, prop, text_style } from '@zos/ui'
+import {
+  onKey, offKey,
+  KEY_UP, KEY_DOWN, KEY_SELECT, KEY_BACK, KEY_SHORTCUT,
+  KEY_EVENT_CLICK, KEY_EVENT_LONG_PRESS,
+} from '@zos/interaction'
+import { Geolocation, Compass, Vibrator } from '@zos/sensor'
+import { setPageBrightTime, resetPageBrightTime, setWakeUpRelaunch } from '@zos/display'
 import { getDeviceInfo } from '@zos/device'
+import { LocalStorage } from '@zos/storage'
+import { exit } from '@zos/router'
 
-const STORAGE_KEY = 'trackback_route'
-const EARTH_RADIUS = 6371000 // m
+// ---------- Button mapping (edit if a button doesn't respond) ----------
+const START_KEYS = [KEY_SELECT, KEY_UP]
+const BACK_KEYS = [KEY_BACK, KEY_DOWN, KEY_SHORTCUT]
 
-const ARRIVE_RADIUS = 15 // m — close enough to a waypoint to count it as passed
-const START_RADIUS = 12 // m — close enough to the start to end the walk
-const DRIFT_RADIUS = 40 // m — trigger the off-route buzz past this distance
-const MIN_POINT_DIST = 5 // m — minimum spacing between recorded route points
-const LOOKAHEAD = 12 // waypoints to scan ahead for a "rejoined further along" skip
-const VIBRATE_COOLDOWN = 15000 // ms between repeated drift buzzes
+// ---------- Tuning ----------
+const MIN_STEP_M = 5         // ignore GPS jitter smaller than this
+const MAX_JUMP_M = 200       // ignore sudden jumps bigger than this...
+const JUMP_GRACE_MS = 20000  // ...unless GPS was lost for this long
+const WAYPOINT_REACHED_M = 15
+const SHORTCUT_M = 25        // snap forward if you rejoin the route further along
+const OFF_ROUTE_M = 40
+const ARRIVED_M = 20
+const MIN_MAP_SPAN_M = 150   // don't zoom in closer than this
+const MAX_SEGMENTS = 400     // draw at most this many line segments
+const SAVE_KEY = 'trackback_route'
 
-const CARDINALS = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW']
+// ---------- Colors ----------
+const C_ROUTE = 0x00c853
+const C_ROUTE_DONE = 0x555555
+const C_TODO = 0xff9100
+const C_START = 0x2979ff
+const C_ME = 0xffffff
+const C_TEXT_DIM = 0x9e9e9e
 
-function toRad(deg) {
-  return (deg * Math.PI) / 180
+// ---------- State ----------
+let state = 'idle' // idle | tracking | stopped | backtrack
+let track = []     // [{lat, lon}]
+let cum = []       // cumulative distance along track, for TrackBack
+let distance = 0
+let current = null
+let gpsOk = false
+let lastAddAt = 0
+let recStartedAt = 0
+let recAccum = 0
+let unsavedPoints = 0
+
+let ti = 0         // TrackBack: index of next waypoint (walking towards 0)
+let remaining = 0
+let arrived = false
+let offRoute = false
+
+let geo, compass, vibrator, storage, tickTimer
+let W, H, A, mapX, mapY
+let canvas, topText, bottomText
+
+// ---------- Geo helpers ----------
+const RAD = Math.PI / 180
+function distM(a, b) {
+  const dLat = (b.lat - a.lat) * RAD
+  const dLon = (b.lon - a.lon) * RAD
+  const s = Math.sin(dLat / 2) ** 2 +
+    Math.cos(a.lat * RAD) * Math.cos(b.lat * RAD) * Math.sin(dLon / 2) ** 2
+  return 2 * 6371000 * Math.asin(Math.sqrt(s))
+}
+function bearing(a, b) {
+  const y = Math.sin((b.lon - a.lon) * RAD) * Math.cos(b.lat * RAD)
+  const x = Math.cos(a.lat * RAD) * Math.sin(b.lat * RAD) -
+    Math.sin(a.lat * RAD) * Math.cos(b.lat * RAD) * Math.cos((b.lon - a.lon) * RAD)
+  return (Math.atan2(y, x) / RAD + 360) % 360
+}
+function compassPoint(deg) {
+  return ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'][Math.round(deg / 45) % 8]
 }
 
-function toDeg(rad) {
-  return (rad * 180) / Math.PI
+// ---------- Formatting ----------
+function fmtDist(m) {
+  return m < 1000 ? Math.round(m) + ' m' : (m / 1000).toFixed(2) + ' km'
+}
+function fmtTime(ms) {
+  const t = Math.floor(ms / 1000)
+  const h = Math.floor(t / 3600), m = Math.floor(t / 60) % 60, s = t % 60
+  const p = (n) => (n < 10 ? '0' + n : '' + n)
+  return (h ? h + ':' : '') + p(m) + ':' + p(s)
+}
+function recElapsed() {
+  return state === 'tracking' ? recAccum + (Date.now() - recStartedAt) : recAccum
 }
 
-function haversine(lat1, lon1, lat2, lon2) {
-  const dLat = toRad(lat2 - lat1)
-  const dLon = toRad(lon2 - lon1)
-  const s1 = Math.sin(dLat / 2)
-  const s2 = Math.sin(dLon / 2)
-  const a = s1 * s1 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * s2 * s2
-  return 2 * EARTH_RADIUS * Math.asin(Math.min(1, Math.sqrt(a)))
+// ---------- Small utilities ----------
+function safe(fn) { try { fn() } catch (e) { console.log('safe: ' + e) } }
+function buzz() {
+  safe(() => { vibrator.start(); setTimeout(() => safe(() => vibrator.stop()), 500) })
 }
 
-function bearing(lat1, lon1, lat2, lon2) {
-  const y = Math.sin(toRad(lon2 - lon1)) * Math.cos(toRad(lat2))
-  const x =
-    Math.cos(toRad(lat1)) * Math.sin(toRad(lat2)) -
-    Math.sin(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.cos(toRad(lon2 - lon1))
-  return (toDeg(Math.atan2(y, x)) + 360) % 360
+// ---------- Persistence (route survives the app closing) ----------
+function saveRoute() {
+  safe(() => {
+    const data = track.map((p) => [+p.lat.toFixed(6), +p.lon.toFixed(6)])
+    storage.setItem(SAVE_KEY, JSON.stringify({ pts: data, t: recAccum }))
+    unsavedPoints = 0
+  })
+}
+function loadRoute() {
+  safe(() => {
+    const raw = storage.getItem(SAVE_KEY, '')
+    if (!raw) return
+    const obj = JSON.parse(raw)
+    track = (obj.pts || []).map((a) => ({ lat: a[0], lon: a[1] }))
+    recAccum = obj.t || 0
+    distance = 0
+    for (let i = 1; i < track.length; i++) distance += distM(track[i - 1], track[i])
+    if (track.length >= 2) state = 'stopped'
+    else track = []
+  })
+}
+function clearRoute() {
+  track = []; cum = []; distance = 0; recAccum = 0
+  safe(() => storage.removeItem(SAVE_KEY))
 }
 
-// Signed difference target-minus-current in (-180, 180], positive = turn right.
-function angleDiff(target, current) {
-  return ((target - current + 540) % 360) - 180
+// ---------- GPS ----------
+function onGps() {
+  if (geo.getStatus() !== 'A') {
+    gpsOk = false
+    render()
+    return
+  }
+  const lat = geo.getLatitude()
+  const lon = geo.getLongitude()
+  if (typeof lat !== 'number' || typeof lon !== 'number') return
+  gpsOk = true
+  current = { lat, lon }
+
+  if (state === 'tracking') addPoint(current)
+  if (state === 'backtrack') updateBacktrack()
+  render()
 }
 
-function cardinal(bearingDeg) {
-  return CARDINALS[Math.round(bearingDeg / 45) % 8]
+function addPoint(p) {
+  const now = Date.now()
+  const last = track[track.length - 1]
+  if (!last) {
+    track.push(p); lastAddAt = now; unsavedPoints++
+    return
+  }
+  const d = distM(last, p)
+  if (d < MIN_STEP_M) return
+  if (d > MAX_JUMP_M && now - lastAddAt < JUMP_GRACE_MS) return
+  track.push(p)
+  distance += d
+  lastAddAt = now
+  if (++unsavedPoints >= 30) saveRoute()
 }
 
-// Flat-earth projection (meters) around the start point, good enough for a walk.
-function project(lat, lon, lat0, lon0) {
-  const x = toRad(lon - lon0) * Math.cos(toRad(lat0)) * EARTH_RADIUS
-  const y = toRad(lat - lat0) * EARTH_RADIUS
-  return { x: x, y: y }
-}
-
-Page({
-  state: {
-    mode: 'idle', // idle | recording | trackback | done
-    route: [], // [{lat, lon}], route[0] is always the start point
-    idx: 0, // trackback: index of the next route point still to reach, counting down to 0
-  },
-
-  gps: { lat: 0, lon: 0, valid: false },
-  heading: { angle: 0, calibrated: false },
-  lastDriftVibrate: 0,
-
-  onInit() {
-    const saved = localStorage.getItem(STORAGE_KEY, null)
-    if (saved && saved.route && saved.route.length) {
-      this.state = saved
+// ---------- TrackBack ----------
+function startBacktrack() {
+  if (track.length < 2) return
+  cum = [0]
+  for (let i = 1; i < track.length; i++) cum.push(cum[i - 1] + distM(track[i - 1], track[i]))
+  ti = track.length - 1
+  arrived = false
+  offRoute = false
+  if (current) {
+    // start from the closest point on the route
+    let best = Infinity
+    for (let i = 0; i < track.length; i++) {
+      const d = distM(current, track[i])
+      if (d < best) { best = d; ti = i }
     }
-  },
+  }
+  safe(() => compass.start())
+  state = 'backtrack'
+  if (current) updateBacktrack()
+}
 
+function updateBacktrack() {
+  if (!current || arrived) return
+
+  if (distM(current, track[0]) < ARRIVED_M) {
+    arrived = true
+    remaining = 0
+    buzz()
+    return
+  }
+
+  // shortcut: if you've rejoined the route closer to the start, jump ahead
+  let nearestD = Infinity
+  for (let i = 0; i <= ti; i++) {
+    const d = distM(current, track[i])
+    if (d < nearestD) nearestD = d
+    if (d < SHORTCUT_M && i < ti) { ti = i; break }
+  }
+  while (ti > 0 && distM(current, track[ti]) < WAYPOINT_REACHED_M) ti--
+
+  remaining = distM(current, track[ti]) + cum[ti]
+
+  const nowOff = nearestD > OFF_ROUTE_M
+  if (nowOff && !offRoute) buzz()
+  offRoute = nowOff
+}
+
+function turnHint() {
+  if (!current) return ''
+  const brg = bearing(current, track[ti])
+  let heading = 'INVALID'
+  safe(() => { if (compass.getStatus()) heading = compass.getDirectionAngle() })
+  if (typeof heading !== 'number') return 'Head ' + compassPoint(brg)
+  const rel = ((brg - heading + 540) % 360) - 180
+  if (Math.abs(rel) < 20) return 'Straight ahead'
+  if (Math.abs(rel) > 150) return 'Turn around'
+  return (rel > 0 ? 'Turn right ' : 'Turn left ') + Math.round(Math.abs(rel)) + '°'
+}
+
+// ---------- Drawing ----------
+function drawMap() {
+  canvas.clear({ x: 0, y: 0, w: A, h: A })
+
+  const pts = current ? track.concat([current]) : track
+  if (!pts.length) {
+    canvas.drawText({
+      x: A / 2 - 90, y: A / 2 - 15, text_size: 24, color: C_TEXT_DIM,
+      text: gpsOk ? 'Ready' : 'Waiting for GPS',
+    })
+    return
+  }
+
+  let minLat = Infinity, maxLat = -Infinity, minLon = Infinity, maxLon = -Infinity
+  for (const p of pts) {
+    if (p.lat < minLat) minLat = p.lat
+    if (p.lat > maxLat) maxLat = p.lat
+    if (p.lon < minLon) minLon = p.lon
+    if (p.lon > maxLon) maxLon = p.lon
+  }
+  const lat0 = (minLat + maxLat) / 2
+  const lon0 = (minLon + maxLon) / 2
+  const kx = 111320 * Math.cos(lat0 * RAD)
+  const ky = 110540
+  const span = Math.max((maxLon - minLon) * kx, (maxLat - minLat) * ky, MIN_MAP_SPAN_M)
+  const scale = (A - 30) / span
+  const toXY = (p) => ({
+    x: Math.round(A / 2 + (p.lon - lon0) * kx * scale),
+    y: Math.round(A / 2 - (p.lat - lat0) * ky * scale),
+  })
+
+  const drawPath = (from, to, color, width) => {
+    if (to - from < 1) return
+    canvas.setPaint({ color, line_width: width })
+    const step = Math.max(1, Math.ceil((to - from) / MAX_SEGMENTS))
+    let prev = toXY(track[from])
+    for (let i = from + step; ; i += step) {
+      if (i > to) i = to
+      const q = toXY(track[i])
+      canvas.drawLine({ x1: prev.x, y1: prev.y, x2: q.x, y2: q.y, color })
+      prev = q
+      if (i === to) break
+    }
+  }
+
+  if (state === 'backtrack') {
+    drawPath(0, track.length - 1, C_ROUTE_DONE, 4)
+    drawPath(0, ti, C_TODO, 5)
+    if (current && !arrived) {
+      const a = toXY(current), b = toXY(track[ti])
+      canvas.setPaint({ color: C_TODO, line_width: 2 })
+      canvas.drawLine({ x1: a.x, y1: a.y, x2: b.x, y2: b.y, color: C_TODO })
+    }
+  } else {
+    drawPath(0, track.length - 1, C_ROUTE, 4)
+  }
+
+  if (track.length) {
+    const s = toXY(track[0])
+    canvas.drawCircle({ center_x: s.x, center_y: s.y, radius: 8, color: C_START })
+  }
+
+  if (current) {
+    const c = toXY(current)
+    if (state === 'backtrack' && !arrived) {
+      const deg = bearing(current, track[ti])
+      const pt = (ang, r) => ({
+        x: Math.round(c.x + r * Math.sin(ang * RAD)),
+        y: Math.round(c.y - r * Math.cos(ang * RAD)),
+      })
+      const tip = pt(deg, 16)
+      canvas.drawPoly({
+        data_array: [tip, pt(deg + 140, 11), pt(deg - 140, 11), tip],
+        color: C_ME,
+      })
+    } else {
+      canvas.drawCircle({ center_x: c.x, center_y: c.y, radius: 6, color: C_ME })
+    }
+  }
+}
+
+function renderText() {
+  let top = '', bottom = ''
+  const gps = gpsOk ? '' : ' · no GPS'
+  switch (state) {
+    case 'idle':
+      top = gpsOk ? 'GPS ready' : 'Searching GPS...'
+      bottom = 'Start = record route'
+      break
+    case 'tracking':
+      top = 'REC ' + fmtTime(recElapsed()) + ' · ' + fmtDist(distance) + gps
+      bottom = 'Start = stop'
+      break
+    case 'stopped':
+      top = 'Stopped · ' + fmtDist(distance)
+      bottom = 'Start = TrackBack\nBack = resume · Hold = new'
+      break
+    case 'backtrack':
+      if (arrived) {
+        top = 'You are back!'
+        bottom = 'Start = done'
+      } else {
+        top = fmtDist(remaining) + ' to start' + gps
+        bottom = (offRoute ? 'Off route · ' : '') + turnHint()
+      }
+      break
+  }
+  topText.setProperty(prop.TEXT, top)
+  bottomText.setProperty(prop.TEXT, bottom)
+}
+
+function render() {
+  drawMap()
+  renderText()
+}
+
+// ---------- Buttons ----------
+function startRecording() {
+  recStartedAt = Date.now()
+  lastAddAt = Date.now()
+  state = 'tracking'
+  if (current) addPoint(current)
+}
+function stopRecording() {
+  recAccum += Date.now() - recStartedAt
+  state = 'stopped'
+  saveRoute()
+}
+function endBacktrack() {
+  safe(() => compass.stop())
+  state = 'stopped'
+}
+
+function handleKey(key, event) {
+  const isStart = START_KEYS.indexOf(key) !== -1
+  const isBack = BACK_KEYS.indexOf(key) !== -1
+  if (!isStart && !isBack) return false // leave other keys to the system
+
+  if (isStart && event === KEY_EVENT_CLICK) {
+    if (state === 'idle') startRecording()
+    else if (state === 'tracking') stopRecording()
+    else if (state === 'stopped') startBacktrack()
+    else if (state === 'backtrack') endBacktrack()
+  }
+
+  if (isBack && event === KEY_EVENT_CLICK) {
+    if (state === 'idle') { exit(); return true }
+    if (state === 'stopped') startRecording()
+    else if (state === 'backtrack') endBacktrack()
+    // while recording, Back does nothing so you can't quit by accident
+  }
+
+  if (isBack && event === KEY_EVENT_LONG_PRESS && state === 'stopped') {
+    clearRoute()
+    state = 'idle'
+  }
+
+  render()
+  return true
+}
+
+// ---------- Page ----------
+Page({
   build() {
     const info = getDeviceInfo()
-    this.W = info.width
-    this.H = info.height
+    W = info.width
+    H = info.height
+    A = Math.round(Math.min(W, H) * 0.68) // square map that fits a round screen
+    mapX = Math.round((W - A) / 2)
+    mapY = Math.round((H - A) / 2)
 
-    this.canvas = createWidget(widget.CANVAS, { x: 0, y: 0, w: this.W, h: this.H })
-
-    this.statusText = createWidget(widget.TEXT, {
-      x: 10,
-      y: Math.round(this.H * 0.06),
-      w: this.W - 20,
-      h: Math.round(this.H * 0.14),
-      color: 0xffffff,
-      text_size: 22,
-      align_h: align.CENTER_H,
-      align_v: align.CENTER_V,
+    topText = createWidget(widget.TEXT, {
+      x: 0, y: mapY - 48, w: W, h: 44,
+      text_size: 24, color: 0xffffff,
+      align_h: align.CENTER_H, align_v: align.CENTER_V,
+      text: '',
+    })
+    canvas = createWidget(widget.CANVAS, { x: mapX, y: mapY, w: A, h: A })
+    bottomText = createWidget(widget.TEXT, {
+      x: Math.round(W * 0.15), y: mapY + A + 2, w: Math.round(W * 0.7), h: 56,
+      text_size: 20, color: C_TEXT_DIM,
+      align_h: align.CENTER_H, align_v: align.TOP,
       text_style: text_style.WRAP,
       text: '',
     })
 
-    this.dirText = createWidget(widget.TEXT, {
-      x: 10,
-      y: Math.round(this.H * 0.2),
-      w: this.W - 20,
-      h: Math.round(this.H * 0.16),
-      color: 0xffcc33,
-      text_size: 26,
-      align_h: align.CENTER_H,
-      align_v: align.CENTER_V,
-      text_style: text_style.WRAP,
-      text: '',
-    })
+    storage = new LocalStorage()
+    vibrator = new Vibrator()
+    compass = new Compass()
+    geo = new Geolocation()
+    geo.onChange(onGps)
+    geo.start()
 
-    this.actionBtnGeom = { x: Math.round(this.W / 2 - 85), y: this.H - 90, w: 170, h: 64 }
-    this.actionBtn = createWidget(widget.BUTTON, Object.assign({}, this.actionBtnGeom, {
-      radius: 32,
-      text: '',
-      text_size: 26,
-      normal_color: 0x2277ff,
-      press_color: 0x1a55cc,
-      click_func: () => this.onActionClick(),
-    }))
+    loadRoute()
 
-    this.resetBtnGeom = { x: this.W - 90, y: 10, w: 80, h: 44 }
-    this.resetBtn = createWidget(widget.BUTTON, Object.assign({}, this.resetBtnGeom, {
-      radius: 22,
-      text: 'Reset',
-      text_size: 18,
-      normal_color: 0x882222,
-      press_color: 0x661111,
-      click_func: () => this.onResetClick(),
-    }))
+    // keep the app on screen while you walk
+    safe(() => setPageBrightTime({ brightTime: 60 * 60 * 1000 }))
+    safe(() => setWakeUpRelaunch({ relaunch: true }))
 
-    this.geolocation = new Geolocation()
-    this.onGpsChange = () => {
-      if (this.geolocation.getStatus() === 'A') {
-        this.gps.lat = this.geolocation.getLatitude()
-        this.gps.lon = this.geolocation.getLongitude()
-        this.gps.valid = true
-      }
-    }
-    this.geolocation.onChange(this.onGpsChange)
-    this.geolocation.start()
-
-    this.compass = new Compass()
-    this.onCompassChange = () => {
-      this.heading.calibrated = !!this.compass.getStatus()
-      if (this.heading.calibrated) {
-        const angle = this.compass.getDirectionAngle()
-        if (angle !== 'INVALID') this.heading.angle = angle
-      }
-    }
-    this.compass.onChange(this.onCompassChange)
-    this.compass.start()
-
-    this.vibrator = new Vibrator()
-
-    this.updateButtonLabel()
-    this.render()
-
-    this.tickCount = 0
-    this.timer = setInterval(() => this.tick(), 1000)
-  },
-
-  onActionClick() {
-    const mode = this.state.mode
-    if (mode === 'idle' || mode === 'done') {
-      if (!this.gps.valid) return
-      this.state = {
-        mode: 'recording',
-        route: [{ lat: this.gps.lat, lon: this.gps.lon }],
-        idx: 0,
-      }
-    } else if (mode === 'recording') {
-      if (this.state.route.length < 2) return
-      this.state.mode = 'trackback'
-      this.state.idx = this.state.route.length - 1
-    } else if (mode === 'trackback') {
-      this.state.mode = 'idle'
-    }
-    this.save()
-    this.updateButtonLabel()
-    this.render()
-  },
-
-  onResetClick() {
-    this.state = { mode: 'idle', route: [], idx: 0 }
-    localStorage.removeItem(STORAGE_KEY)
-    this.updateButtonLabel()
-    this.render()
-  },
-
-  updateButtonLabel() {
-    const labels = { idle: 'Start', recording: 'TrackBack', trackback: 'Stop', done: 'New Route' }
-    this.actionBtn.setProperty(prop.MORE, Object.assign({}, this.actionBtnGeom, {
-      text: labels[this.state.mode] || 'Start',
-    }))
-  },
-
-  tick() {
-    this.tickCount++
-    const mode = this.state.mode
-
-    if (mode === 'recording' && this.gps.valid) {
-      const last = this.state.route[this.state.route.length - 1]
-      const d = haversine(last.lat, last.lon, this.gps.lat, this.gps.lon)
-      if (d >= MIN_POINT_DIST) {
-        this.state.route.push({ lat: this.gps.lat, lon: this.gps.lon })
-      }
-    } else if (mode === 'trackback' && this.gps.valid) {
-      this.updateTrackback()
-    }
-
-    if (this.tickCount % 5 === 0 || mode !== this.lastSavedMode) {
-      this.save()
-      this.lastSavedMode = mode
-    }
-
-    this.render()
-  },
-
-  // Advances state.idx toward 0 (the start). Scans a lookahead window so that
-  // rejoining the route further along skips ahead instead of retracing it.
-  updateTrackback() {
-    const route = this.state.route
-    const start = route[0]
-    let idx = this.state.idx
-
-    let advanced = true
-    while (advanced && idx > 0) {
-      advanced = false
-      const lo = Math.max(0, idx - LOOKAHEAD)
-      for (let j = lo; j <= idx; j++) {
-        if (haversine(this.gps.lat, this.gps.lon, route[j].lat, route[j].lon) < ARRIVE_RADIUS) {
-          idx = j - 1
-          advanced = true
-          break
-        }
-      }
-    }
-    if (idx < 0) idx = 0
-    this.state.idx = idx
-
-    const distStart = haversine(this.gps.lat, this.gps.lon, start.lat, start.lon)
-    if (idx === 0 && distStart < START_RADIUS) {
-      this.state.mode = 'done'
-      this.buzz()
-      this.save()
-      return
-    }
-
-    let minDist = Infinity
-    for (let i = 0; i <= idx; i++) {
-      const d = haversine(this.gps.lat, this.gps.lon, route[i].lat, route[i].lon)
-      if (d < minDist) minDist = d
-    }
-    const now = Date.now()
-    if (minDist > DRIFT_RADIUS && now - this.lastDriftVibrate > VIBRATE_COOLDOWN) {
-      this.buzz()
-      this.lastDriftVibrate = now
-    }
-  },
-
-  buzz() {
-    this.vibrator.setMode(VIBRATOR_SCENE_DURATION)
-    this.vibrator.start()
-  },
-
-  save() {
-    localStorage.setItem(STORAGE_KEY, this.state)
-  },
-
-  render() {
-    this.canvas.clear({ x: 0, y: 0, w: this.W, h: this.H })
-    if (this.state.route.length) {
-      this.drawMap()
-    }
-    this.updateTexts()
-  },
-
-  drawMap() {
-    const route = this.state.route
-    const mode = this.state.mode
-    const start = route[0]
-    const cx = Math.round(this.W / 2)
-    const cy = Math.round(this.H * 0.6)
-
-    const curLat = this.gps.valid ? this.gps.lat : route[route.length - 1].lat
-    const curLon = this.gps.valid ? this.gps.lon : route[route.length - 1].lon
-
-    let maxDist = 20
-    const projPts = []
-    for (let i = 0; i < route.length; i++) {
-      const p = project(route[i].lat, route[i].lon, start.lat, start.lon)
-      projPts.push(p)
-      const d = Math.sqrt(p.x * p.x + p.y * p.y)
-      if (d > maxDist) maxDist = d
-    }
-    const curProj = project(curLat, curLon, start.lat, start.lon)
-    const curDist = Math.sqrt(curProj.x * curProj.x + curProj.y * curProj.y)
-    if (curDist > maxDist) maxDist = curDist
-
-    const usable = Math.min(this.W, this.H) * 0.36
-    const scale = usable / maxDist
-
-    const toScreen = (p) => ({ x: cx + p.x * scale, y: cy - p.y * scale })
-    const screenPts = []
-    for (let i = 0; i < projPts.length; i++) screenPts.push(toScreen(projPts[i]))
-    const curScreen = toScreen(curProj)
-
-    // Edges up to and including state.idx are the part still to walk during trackback.
-    const orangeUpTo = mode === 'trackback' || mode === 'done' ? this.state.idx : -1
-
-    this.canvas.setPaint({ color: 0x2ecc71, line_width: 4 })
-    for (let i = 1; i < screenPts.length; i++) {
-      const isOrange = orangeUpTo >= 0 && i <= orangeUpTo
-      this.canvas.drawLine({
-        x1: screenPts[i - 1].x,
-        y1: screenPts[i - 1].y,
-        x2: screenPts[i].x,
-        y2: screenPts[i].y,
-        color: isOrange ? 0xff8800 : 0x2ecc71,
-      })
-    }
-
-    this.canvas.drawCircle({ center_x: screenPts[0].x, center_y: screenPts[0].y, radius: 8, color: 0x2277ff })
-
-    if (mode === 'trackback') {
-      this.drawArrow(curScreen)
-    } else {
-      this.canvas.drawCircle({ center_x: curScreen.x, center_y: curScreen.y, radius: 7, color: 0xffffff })
-    }
-  },
-
-  drawArrow(pos) {
-    const target = this.state.route[this.state.idx]
-    const brg = bearing(this.gps.lat, this.gps.lon, target.lat, target.lon)
-    const rad = toRad(brg)
-    const len = 16
-    const tipX = pos.x + Math.sin(rad) * len
-    const tipY = pos.y - Math.cos(rad) * len
-    this.canvas.setPaint({ color: 0xff8800, line_width: 5 })
-    this.canvas.drawLine({ x1: pos.x, y1: pos.y, x2: tipX, y2: tipY, color: 0xff8800 })
-    this.canvas.drawCircle({ center_x: tipX, center_y: tipY, radius: 5, color: 0xff8800 })
-    this.canvas.drawCircle({ center_x: pos.x, center_y: pos.y, radius: 5, color: 0xffffff })
-  },
-
-  updateTexts() {
-    const mode = this.state.mode
-    let line1 = ''
-    let line2 = ''
-
-    if (mode === 'idle') {
-      line2 = this.gps.valid ? 'Press Start to record a route' : 'Waiting for GPS...'
-    } else {
-      const start = this.state.route[0]
-      const distStart = this.gps.valid
-        ? haversine(this.gps.lat, this.gps.lon, start.lat, start.lon)
-        : 0
-      line1 = Math.round(distStart) + ' m from start'
-
-      if (mode === 'recording') {
-        line2 = 'Recording route...'
-      } else if (mode === 'done') {
-        line2 = 'You are back!'
-      } else if (mode === 'trackback' && this.gps.valid) {
-        const target = this.state.route[this.state.idx]
-        const brg = bearing(this.gps.lat, this.gps.lon, target.lat, target.lon)
-        if (this.heading.calibrated) {
-          const diff = angleDiff(brg, this.heading.angle)
-          if (Math.abs(diff) < 15) {
-            line2 = 'Straight ahead'
-          } else if (diff > 0) {
-            line2 = 'Turn right ' + Math.round(diff) + '°'
-          } else {
-            line2 = 'Turn left ' + Math.round(-diff) + '°'
-          }
-        } else {
-          line2 = 'Head ' + cardinal(brg)
-        }
-      }
-    }
-
-    this.statusText.setProperty(prop.MORE, { text: line1 })
-    this.dirText.setProperty(prop.MORE, { text: line2 })
+    tickTimer = setInterval(renderText, 1000)
+    onKey({ callback: handleKey })
+    render()
   },
 
   onDestroy() {
-    if (this.timer) clearInterval(this.timer)
-    if (this.geolocation) {
-      this.geolocation.offChange(this.onGpsChange)
-      this.geolocation.stop()
-    }
-    if (this.compass) {
-      this.compass.offChange(this.onCompassChange)
-      this.compass.stop()
-    }
-    this.save()
+    if (state === 'tracking') stopRecording()
+    else if (track.length) saveRoute()
+    if (tickTimer) clearInterval(tickTimer)
+    safe(() => geo.offChange(onGps))
+    safe(() => geo.stop())
+    safe(() => compass.stop())
+    safe(() => offKey())
+    safe(() => resetPageBrightTime())
   },
 })

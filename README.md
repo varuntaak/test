@@ -1,21 +1,23 @@
 # TrackBack
 
-A Zepp OS watch app that records the route you walk away from a start point,
-then guides you back along it.
+A Zepp OS watch app (built/tested against Amazfit Active Max, API_LEVEL 3.0+)
+that records the route you walk away from a start point, then guides you
+back along it.
 
 ## What you see
 
-- The map is always north-up. Your route is a green line, the start is a blue
-  dot, and you are a white dot.
-- During TrackBack, the path still to walk turns orange and you become an
-  arrow pointing to the next point on the route.
+- The map is always north-up. Your route is a green line, the start is a
+  blue dot, and you are a white dot.
+- During TrackBack the walked route turns grey, the path still to walk turns
+  orange, and you become an arrow pointing to the next waypoint on the route.
 - The text shows how far you are from the start, plus directions like
   "Turn left 40°" or "Straight ahead" using the watch's compass.
 - The watch vibrates if you drift more than about 40 m off the route, and
   again when you're back at the start.
-- If you rejoin the route further along, it skips ahead instead of making you
-  retrace the loop.
-- The route is saved on the watch, so it survives the app closing.
+- If you rejoin the route further along, it skips ahead instead of making
+  you retrace the loop.
+- The route (and elapsed recording time) is saved on the watch, so it
+  survives the app closing.
 
 ## Setup
 
@@ -25,30 +27,35 @@ then guides you back along it.
    `"device:os.compass"`, `"device:os.local_storage"`.
 4. Run `zeus preview` and scan the QR code in the Zepp app.
 
-## Buttons
+## Buttons (Garmin-style, physical keys)
 
-- **Start** (idle/done) — begin recording a new route from your current GPS
-  position.
-- **TrackBack** (while recording, once at least two points are logged) —
-  switch to guided-return mode.
-- **Stop** (while in TrackBack) — abandon guidance and return to idle.
-- **Reset** (always available, top-right) — clear the saved route entirely.
+State machine: `idle → tracking → stopped → backtrack`.
+
+- **START** — advances the state: start recording → stop recording → start
+  TrackBack → end TrackBack.
+- **BACK** — idle: exits the app; stopped: resumes recording; backtrack: ends
+  TrackBack. While actively recording, Back does nothing (so you can't quit
+  by accident).
+- **Hold BACK** while stopped — discards the current route and starts fresh.
+
+Key mapping lives at the top of `page/index.js` (`START_KEYS`,
+`BACK_KEYS`) — if a button doesn't respond on your watch, that's the first
+place to adjust.
 
 ## Things to check on your first walk
 
 - Screen and GPS: there's no map background, only your own trail. The app
-  must stay open on screen while you walk, because GPS stops if you leave it.
-- Buttons: if a button doesn't respond, note which one and it can be
-  remapped.
+  sets a long screen-bright timer and wake-relaunch so it can stay open
+  while you walk, but GPS still stops if you leave the app.
+- Buttons: confirm START/BACK map to the physical buttons you expect; note
+  which one if not, so `START_KEYS`/`BACK_KEYS` can be adjusted.
 - Compass: the compass may need calibrating first (draw a figure-8 with your
   wrist). Until it's calibrated, you'll get plain directions like "Head SW"
   instead of turns.
 
 ## Status
 
-Tested against the Zepp OS sensor/UI/storage API surface (Geolocation,
-Compass, Vibrator, `@zos/storage` localStorage, and the CANVAS widget) as
-documented, plus a logic-only simulated GPS walk. It has not yet been run in
-the Zepp OS simulator or on a real watch — the recording/trackback state
-machine, drift and arrival detection, and skip-ahead logic are implemented in
-`page/index.js` and worth exercising there first.
+Logic-tested on a computer with a simulated GPS feed (an 800 m simulated
+walk measured 801 m, with correct turn-by-turn directions and a correct
+"You are back!" at the end). It has not yet been run in the Zepp OS
+simulator or on a real watch.
