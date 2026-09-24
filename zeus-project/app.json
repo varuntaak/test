@@ -9,7 +9,8 @@
       "name": "1.0.0"
     },
     "vender": "dev",
-    "description": "Record a route and walk it back"
+    "description": "Record a route and walk it back",
+    "icon": "icon.png"
   },
   "permissions": [
     "device:os.geolocation",
