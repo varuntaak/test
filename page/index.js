@@ -340,8 +340,12 @@ function renderText() {
 }
 
 function render() {
-  drawMap()
-  renderText()
+  try {
+    drawMap()
+    renderText()
+  } catch (e) {
+    console.log('[tb] render FAILED: ' + e)
+  }
 }
 
 // ---------- Buttons ----------
@@ -392,9 +396,11 @@ function handleKey(key, event) {
 // ---------- Page ----------
 Page({
   build() {
+    console.log('[tb] build:start')
     const info = getDeviceInfo()
     W = info.width
     H = info.height
+    console.log('[tb] deviceInfo ' + W + 'x' + H)
     A = Math.round(Math.min(W, H) * 0.68) // square map that fits a round screen
     mapX = Math.round((W - A) / 2)
     mapY = Math.round((H - A) / 2)
@@ -405,7 +411,9 @@ Page({
       align_h: align.CENTER_H, align_v: align.CENTER_V,
       text: '',
     })
+    console.log('[tb] topText created')
     canvas = createWidget(widget.CANVAS, { x: mapX, y: mapY, w: A, h: A })
+    console.log('[tb] canvas created')
     bottomText = createWidget(widget.TEXT, {
       x: Math.round(W * 0.15), y: mapY + A + 2, w: Math.round(W * 0.7), h: 56,
       text_size: 20, color: C_TEXT_DIM,
@@ -413,6 +421,7 @@ Page({
       text_style: text_style.WRAP,
       text: '',
     })
+    console.log('[tb] bottomText created')
 
     storage = new LocalStorage()
     vibrator = new Vibrator()
@@ -420,16 +429,22 @@ Page({
     geo = new Geolocation()
     geo.onChange(onGps)
     geo.start()
+    console.log('[tb] sensors/storage ready')
 
     loadRoute()
+    console.log('[tb] loadRoute done, mode=' + state)
 
     // keep the app on screen while you walk
     safe(() => setPageBrightTime({ brightTime: 60 * 60 * 1000 }))
+    console.log('[tb] setPageBrightTime called')
     safe(() => setWakeUpRelaunch({ relaunch: true }))
+    console.log('[tb] setWakeUpRelaunch called')
 
     tickTimer = setInterval(renderText, 1000)
     onKey({ callback: handleKey })
+    console.log('[tb] onKey registered')
     render()
+    console.log('[tb] build:end')
   },
 
   onDestroy() {
