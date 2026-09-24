@@ -21,11 +21,32 @@ back along it.
 
 ## Setup
 
+### Option A — via `zeus create` (if it works for you)
+
 1. Run `zeus create trackback`.
 2. Replace `page/index.js` with the file in this repo.
 3. In `app.json`, add these permissions: `"device:os.geolocation"`,
    `"device:os.compass"`, `"device:os.local_storage"`.
 4. Run `zeus preview` and scan the QR code in the Zepp app.
+
+### Option B — `zeus-project/`, skipping `zeus create`
+
+`zeus create` currently only offers API_LEVEL up to 4.0, but the Amazfit
+Active Max requires **API_LEVEL 4.2** — its bundled device database predates
+this watch, which is why `create` crashes on it. `zeus-project/` in this repo
+is a hand-built project folder (`app.json`, `app.js`, `page/index.js`) that
+sidesteps `create` entirely, using the device's confirmed Zepp OS data:
+`deviceSource` `10813697`/`10813699`, round 480×480 screen, API_LEVEL 4.2.
+
+```bash
+cp -r zeus-project trackback
+cd trackback
+zeus preview
+```
+
+The three required permissions are already in `zeus-project/app.json`. This
+hasn't been run through `zeus preview`/`zeus build` yet — if it errors,
+that'll tell us what to adjust (e.g. the `targets` block or `apiVersion`).
 
 ## Buttons (Garmin-style, physical keys)
 

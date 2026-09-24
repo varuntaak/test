@@ -1,0 +1,41 @@
+{
+  "configVersion": "v2",
+  "app": {
+    "appId": 1000001,
+    "appName": "TrackBack",
+    "appType": "app",
+    "version": {
+      "code": 1,
+      "name": "1.0.0"
+    },
+    "vender": "dev",
+    "description": "Record a route and walk it back"
+  },
+  "permissions": [
+    "device:os.geolocation",
+    "device:os.compass",
+    "device:os.local_storage"
+  ],
+  "runtime": {
+    "apiVersion": {
+      "compatible": "3.0",
+      "target": "4.2",
+      "minVersion": "3.0"
+    }
+  },
+  "targets": {
+    "active-max": {
+      "module": {
+        "page": {
+          "pages": ["page/index"]
+        }
+      },
+      "platforms": [
+        { "name": "active-max", "deviceSource": 10813697 },
+        { "name": "active-max", "deviceSource": 10813699 }
+      ],
+      "designWidth": 480
+    }
+  },
+  "defaultLanguage": "en-US"
+}
