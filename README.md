@@ -6,10 +6,18 @@ back along it.
 
 ## What you see
 
-- The map is always north-up. Your route is a green line, the start is a
-  blue dot, and you are a white dot.
+- The map is heading-up: "up" on screen is always the direction you're
+  currently facing/moving, so the route feels laid out in front of you
+  instead of the map spinning under a fixed compass. Your route is a green
+  line, the start is a blue dot, and you are a white dot (an arrow during
+  TrackBack). A faint grid rotates with the map for orientation, and a small
+  "N" marker on the map edge plus a heading readout in the top-right corner
+  always show which way you're actually facing.
 - During TrackBack the walked route turns grey, the path still to walk turns
-  orange, and you become an arrow pointing to the next waypoint on the route.
+  orange, and you become an arrow pointing straight up when the next
+  waypoint is ahead of your current heading (and left/right when it isn't).
+  The arrow flashes quickly when a turn is coming up, and gives an
+  occasional confirming blink while you're going straight.
 - The text shows how far you are from the start, plus directions like
   "Turn left 40°" or "Straight ahead" using the watch's compass.
 - The watch vibrates if you drift more than about 40 m off the route, and
@@ -48,20 +56,21 @@ The three required permissions are already in `zeus-project/app.json`. This
 hasn't been run through `zeus preview`/`zeus build` yet — if it errors,
 that'll tell us what to adjust (e.g. the `targets` block or `apiVersion`).
 
-## Buttons (Garmin-style, physical keys)
+## Buttons
 
-State machine: `idle → tracking → stopped → backtrack`.
+At most two buttons are ever on screen at once:
 
-- **START** — advances the state: start recording → stop recording → start
-  TrackBack → end TrackBack.
-- **BACK** — idle: exits the app; stopped: resumes recording; backtrack: ends
-  TrackBack. While actively recording, Back does nothing (so you can't quit
-  by accident).
-- **Hold BACK** while stopped — discards the current route and starts fresh.
+- **idle** → `[Start]`
+- **tracking** (recording) → `[Stop]`
+- **stopped** → `[Go Back]` `[New Route]`
+- **backtrack** → `[Stop]`, or `[New Route]` once you've arrived
 
-Key mapping lives at the top of `page/index.js` (`START_KEYS`,
-`BACK_KEYS`) — if a button doesn't respond on your watch, that's the first
-place to adjust.
+"New Route" always fully resets the recorded track and any TrackBack
+progress before starting a fresh recording. The physical START/BACK keys
+mirror whichever on-screen buttons are currently shown (START = the first
+button, BACK = the second one, or exits the app when idle) — key mapping
+lives at the top of `page/index.js` (`START_KEYS`, `BACK_KEYS`) if a
+physical button doesn't respond on your watch.
 
 ## Things to check on your first walk
 
@@ -76,7 +85,10 @@ place to adjust.
 
 ## Status
 
-Logic-tested on a computer with a simulated GPS feed (an 800 m simulated
-walk measured 801 m, with correct turn-by-turn directions and a correct
-"You are back!" at the end). It has not yet been run in the Zepp OS
-simulator or on a real watch.
+Runs on the Zepp OS simulator (Amazfit Active Max profile) and has been
+walked through recording, stopping, and TrackBack. The heading-up map
+rotation, flashing arrow, grid, and on-screen button layout are newly added
+based on that testing and haven't been re-verified on-device yet — worth a
+fresh walk-through, especially checking the map actually feels "facing
+forward" as you turn, and that the two-button layout isn't cramped on the
+real screen.

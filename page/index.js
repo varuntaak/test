@@ -1,14 +1,24 @@
 // TrackBack for Zepp OS (Amazfit Active Max) — API_LEVEL 3.0+
 // Replace page/index.js of a project created with `zeus create`.
 //
-// Buttons (Garmin-style):
-//   START  : start recording -> stop recording -> start TrackBack -> end TrackBack
-//   BACK   : (idle) exit app  | (stopped) resume recording | (TrackBack) end TrackBack
-//   HOLD BACK while stopped   : discard route and start fresh
+// On-screen buttons, at most two visible at once:
+//   idle       -> [Start]
+//   tracking   -> [Stop]
+//   stopped    -> [Go Back] [New Route]
+//   backtrack  -> [Stop]              (or [New Route] once you've arrived)
+// The physical START/BACK keys mirror whichever buttons are currently shown
+// (START = first button, BACK = second button, or exit the app when idle).
 //
-// Screen: north-up map. Green = your route, blue dot = start,
-// white dot = you. In TrackBack the route turns grey, the part still
-// to walk is orange, and you become an arrow pointing to the next waypoint.
+// Screen: heading-up map — "up" is always the direction you're currently
+// facing/moving, so the route feels like it's laid out in front of you
+// rather than the map spinning as you turn on a fixed compass grid. Green
+// is your recorded route, blue dot is the start. In TrackBack the walked
+// part turns grey, the part still to walk turns orange, and you become an
+// arrow pointing at the next waypoint (relative to your heading, so
+// "straight up" always means "keep going the way you're facing"). A faint
+// grid rotates with the map as an orientation reference, and a small "N"
+// marker on the map edge plus a heading readout in the corner always show
+// which way you're actually facing.
 //
 // app.json -> "permissions" must include:
 //   "device:os.geolocation", "device:os.compass", "device:os.local_storage"
@@ -17,7 +27,7 @@ import { createWidget, widget, align, prop, text_style } from '@zos/ui'
 import {
   onKey, offKey,
   KEY_UP, KEY_DOWN, KEY_SELECT, KEY_BACK, KEY_SHORTCUT,
-  KEY_EVENT_CLICK, KEY_EVENT_LONG_PRESS,
+  KEY_EVENT_CLICK,
 } from '@zos/interaction'
 import { Geolocation, Compass, Vibrator } from '@zos/sensor'
 import { setPageBrightTime, resetPageBrightTime, setWakeUpRelaunch } from '@zos/display'
@@ -37,9 +47,14 @@ const WAYPOINT_REACHED_M = 15
 const SHORTCUT_M = 25        // snap forward if you rejoin the route further along
 const OFF_ROUTE_M = 40
 const ARRIVED_M = 20
-const MIN_MAP_SPAN_M = 150   // don't zoom in closer than this
+const MIN_VIEW_RADIUS_M = 75 // don't zoom in closer than this around the viewer
 const MAX_SEGMENTS = 400     // draw at most this many line segments
 const SAVE_KEY = 'trackback_route'
+const VIEW_ANCHOR_FRAC = 0.72 // how far down the map "you" sit (more room ahead)
+const TURN_STRAIGHT_DEG = 20
+const TURN_AROUND_DEG = 150
+const GRID_STEPS_M = [2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000]
+const GRID_TARGET_PX = 60
 
 // ---------- Colors ----------
 const C_ROUTE = 0x00c853
@@ -48,6 +63,8 @@ const C_TODO = 0xff9100
 const C_START = 0x2979ff
 const C_ME = 0xffffff
 const C_TEXT_DIM = 0x9e9e9e
+const C_GRID = 0x2a2a2a
+const C_NORTH = 0xffd54f
 
 // ---------- State ----------
 let state = 'idle' // idle | tracking | stopped | backtrack
@@ -65,10 +82,19 @@ let ti = 0         // TrackBack: index of next waypoint (walking towards 0)
 let remaining = 0
 let arrived = false
 let offRoute = false
+let turnRel = 0    // signed degrees from current heading to the next waypoint
+
+let heading = 0            // best-known heading, used to rotate the map
+let gpsHeading = null      // course-over-ground, from consecutive GPS fixes
+let compassHeading = null
+let compassCalibrated = false
+let blinkTick = 0
 
 let geo, compass, vibrator, storage, tickTimer
 let W, H, A, mapX, mapY
-let canvas, topText, bottomText
+let canvas, topText, bottomText, headingText, button1, button2
+let button1Action = null
+let button2Action = null
 
 // ---------- Geo helpers ----------
 const RAD = Math.PI / 180
@@ -88,6 +114,10 @@ function bearing(a, b) {
 function compassPoint(deg) {
   return ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'][Math.round(deg / 45) % 8]
 }
+function updateHeading() {
+  if (compassCalibrated && typeof compassHeading === 'number') heading = compassHeading
+  else if (typeof gpsHeading === 'number') heading = gpsHeading
+}
 
 // ---------- Formatting ----------
 function fmtDist(m) {
@@ -101,6 +131,10 @@ function fmtTime(ms) {
 }
 function recElapsed() {
   return state === 'tracking' ? recAccum + (Date.now() - recStartedAt) : recAccum
+}
+function headingLabel() {
+  const deg = Math.round(((heading % 360) + 360) % 360)
+  return compassPoint(heading) + ' ' + deg + '°'
 }
 
 // ---------- Small utilities ----------
@@ -132,6 +166,7 @@ function loadRoute() {
 }
 function clearRoute() {
   track = []; cum = []; distance = 0; recAccum = 0
+  ti = 0; arrived = false; offRoute = false; turnRel = 0
   safe(() => storage.removeItem(SAVE_KEY))
 }
 
@@ -146,7 +181,10 @@ function onGps() {
   const lon = geo.getLongitude()
   if (typeof lat !== 'number' || typeof lon !== 'number') return
   gpsOk = true
+  const prev = current
   current = { lat, lon }
+  if (prev && distM(prev, current) > 3) gpsHeading = bearing(prev, current)
+  updateHeading()
 
   if (state === 'tracking') addPoint(current)
   if (state === 'backtrack') updateBacktrack()
@@ -177,6 +215,7 @@ function startBacktrack() {
   ti = track.length - 1
   arrived = false
   offRoute = false
+  turnRel = 0
   if (current) {
     // start from the closest point on the route
     let best = Infinity
@@ -185,7 +224,6 @@ function startBacktrack() {
       if (d < best) { best = d; ti = i }
     }
   }
-  safe(() => compass.start())
   state = 'backtrack'
   if (current) updateBacktrack()
 }
@@ -197,6 +235,7 @@ function updateBacktrack() {
     arrived = true
     remaining = 0
     buzz()
+    layoutButtons()
     return
   }
 
@@ -210,6 +249,7 @@ function updateBacktrack() {
   while (ti > 0 && distM(current, track[ti]) < WAYPOINT_REACHED_M) ti--
 
   remaining = distM(current, track[ti]) + cum[ti]
+  turnRel = ((bearing(current, track[ti]) - heading + 540) % 360) - 180
 
   const nowOff = nearestD > OFF_ROUTE_M
   if (nowOff && !offRoute) buzz()
@@ -218,22 +258,40 @@ function updateBacktrack() {
 
 function turnHint() {
   if (!current) return ''
-  const brg = bearing(current, track[ti])
-  let heading = 'INVALID'
-  safe(() => { if (compass.getStatus()) heading = compass.getDirectionAngle() })
-  if (typeof heading !== 'number') return 'Head ' + compassPoint(brg)
-  const rel = ((brg - heading + 540) % 360) - 180
-  if (Math.abs(rel) < 20) return 'Straight ahead'
-  if (Math.abs(rel) > 150) return 'Turn around'
-  return (rel > 0 ? 'Turn right ' : 'Turn left ') + Math.round(Math.abs(rel)) + '°'
+  if (!compassCalibrated && gpsHeading == null) {
+    return 'Head ' + compassPoint(bearing(current, track[ti]))
+  }
+  if (Math.abs(turnRel) < TURN_STRAIGHT_DEG) return 'Straight ahead'
+  if (Math.abs(turnRel) > TURN_AROUND_DEG) return 'Turn around'
+  return (turnRel > 0 ? 'Turn right ' : 'Turn left ') + Math.round(Math.abs(turnRel)) + '°'
+}
+
+// Arrow flashes fast while a turn is coming up; while going straight it
+// mostly stays on, with a brief blink every few seconds to confirm you're
+// still on course.
+function arrowVisible() {
+  if (Math.abs(turnRel) >= TURN_STRAIGHT_DEG) return blinkTick % 2 === 0
+  return blinkTick % 5 !== 4
+}
+
+function pickGridSpacing(scale) {
+  let best = GRID_STEPS_M[0]
+  let bestDiff = Infinity
+  for (const step of GRID_STEPS_M) {
+    const diff = Math.abs(step * scale - GRID_TARGET_PX)
+    if (diff < bestDiff) { bestDiff = diff; best = step }
+  }
+  return best
 }
 
 // ---------- Drawing ----------
+// The map is heading-up: everything is drawn relative to the current (or
+// last known) position, rotated so "up" on screen matches `heading`.
 function drawMap() {
   canvas.clear({ x: 0, y: 0, w: A, h: A })
 
-  const pts = current ? track.concat([current]) : track
-  if (!pts.length) {
+  const viewer = current || (track.length ? track[track.length - 1] : null)
+  if (!viewer) {
     canvas.drawText({
       x: A / 2 - 90, y: A / 2 - 15, text_size: 24, color: C_TEXT_DIM,
       text: gpsOk ? 'Ready' : 'Waiting for GPS',
@@ -241,23 +299,29 @@ function drawMap() {
     return
   }
 
-  let minLat = Infinity, maxLat = -Infinity, minLon = Infinity, maxLon = -Infinity
-  for (const p of pts) {
-    if (p.lat < minLat) minLat = p.lat
-    if (p.lat > maxLat) maxLat = p.lat
-    if (p.lon < minLon) minLon = p.lon
-    if (p.lon > maxLon) maxLon = p.lon
-  }
-  const lat0 = (minLat + maxLat) / 2
-  const lon0 = (minLon + maxLon) / 2
-  const kx = 111320 * Math.cos(lat0 * RAD)
+  const kx = 111320 * Math.cos(viewer.lat * RAD)
   const ky = 110540
-  const span = Math.max((maxLon - minLon) * kx, (maxLat - minLat) * ky, MIN_MAP_SPAN_M)
-  const scale = (A - 30) / span
-  const toXY = (p) => ({
-    x: Math.round(A / 2 + (p.lon - lon0) * kx * scale),
-    y: Math.round(A / 2 - (p.lat - lat0) * ky * scale),
+  const cx = A / 2
+  const cy = Math.round(A * VIEW_ANCHOR_FRAC)
+
+  let maxOffset = MIN_VIEW_RADIUS_M
+  for (const p of track) {
+    const dE = (p.lon - viewer.lon) * kx
+    const dN = (p.lat - viewer.lat) * ky
+    const d = Math.sqrt(dE * dE + dN * dN)
+    if (d > maxOffset) maxOffset = d
+  }
+  const scale = (A * 0.42) / maxOffset
+
+  const h = heading * RAD
+  const cosH = Math.cos(h), sinH = Math.sin(h)
+  const rot = (dE, dN) => ({
+    x: Math.round(cx + (dE * cosH - dN * sinH) * scale),
+    y: Math.round(cy - (dE * sinH + dN * cosH) * scale),
   })
+  const toXY = (p) => rot((p.lon - viewer.lon) * kx, (p.lat - viewer.lat) * ky)
+
+  drawGrid(cx, cy, scale, cosH, sinH)
 
   const drawPath = (from, to, color, width) => {
     if (to - from < 1) return
@@ -276,12 +340,7 @@ function drawMap() {
   if (state === 'backtrack') {
     drawPath(0, track.length - 1, C_ROUTE_DONE, 4)
     drawPath(0, ti, C_TODO, 5)
-    if (current && !arrived) {
-      const a = toXY(current), b = toXY(track[ti])
-      canvas.setPaint({ color: C_TODO, line_width: 2 })
-      canvas.drawLine({ x1: a.x, y1: a.y, x2: b.x, y2: b.y, color: C_TODO })
-    }
-  } else {
+  } else if (track.length) {
     drawPath(0, track.length - 1, C_ROUTE, 4)
   }
 
@@ -290,23 +349,51 @@ function drawMap() {
     canvas.drawCircle({ center_x: s.x, center_y: s.y, radius: 8, color: C_START })
   }
 
-  if (current) {
-    const c = toXY(current)
-    if (state === 'backtrack' && !arrived) {
-      const deg = bearing(current, track[ti])
-      const pt = (ang, r) => ({
-        x: Math.round(c.x + r * Math.sin(ang * RAD)),
-        y: Math.round(c.y - r * Math.cos(ang * RAD)),
-      })
-      const tip = pt(deg, 16)
-      canvas.drawPoly({
-        data_array: [tip, pt(deg + 140, 11), pt(deg - 140, 11), tip],
-        color: C_ME,
-      })
-    } else {
-      canvas.drawCircle({ center_x: c.x, center_y: c.y, radius: 6, color: C_ME })
-    }
+  drawNorthTick(cx, cy, cosH, sinH)
+
+  if (state === 'backtrack' && !arrived) {
+    if (arrowVisible()) drawArrow(cx, cy)
+  } else {
+    canvas.drawCircle({ center_x: cx, center_y: cy, radius: 6, color: C_ME })
   }
+}
+
+function drawGrid(cx, cy, scale, cosH, sinH) {
+  const spacing = pickGridSpacing(scale)
+  const halfSpan = A / scale
+  const lines = Math.ceil(halfSpan / spacing) + 1
+  const rot = (dE, dN) => ({
+    x: cx + (dE * cosH - dN * sinH) * scale,
+    y: cy - (dE * sinH + dN * cosH) * scale,
+  })
+  canvas.setPaint({ color: C_GRID, line_width: 1 })
+  for (let i = -lines; i <= lines; i++) {
+    const o = i * spacing
+    let p1 = rot(o, -halfSpan), p2 = rot(o, halfSpan)
+    canvas.drawLine({ x1: p1.x, y1: p1.y, x2: p2.x, y2: p2.y, color: C_GRID })
+    p1 = rot(-halfSpan, o); p2 = rot(halfSpan, o)
+    canvas.drawLine({ x1: p1.x, y1: p1.y, x2: p2.x, y2: p2.y, color: C_GRID })
+  }
+}
+
+function drawNorthTick(cx, cy, cosH, sinH) {
+  const r = A * 0.46
+  const x = cx + (0 * cosH - 1 * sinH) * r
+  const y = cy - (0 * sinH + 1 * cosH) * r
+  canvas.drawText({ x: Math.round(x - 8), y: Math.round(y - 10), text_size: 18, color: C_NORTH, text: 'N' })
+}
+
+function drawArrow(cx, cy) {
+  const rad = turnRel * RAD // 0 = straight up on screen = "keep going"
+  const pt = (ang, r) => ({
+    x: Math.round(cx + r * Math.sin(ang)),
+    y: Math.round(cy - r * Math.cos(ang)),
+  })
+  const tip = pt(rad, 18)
+  canvas.drawPoly({
+    data_array: [tip, pt(rad + 140 * RAD, 12), pt(rad - 140 * RAD, 12), tip],
+    color: C_ME,
+  })
 }
 
 function renderText() {
@@ -315,20 +402,20 @@ function renderText() {
   switch (state) {
     case 'idle':
       top = gpsOk ? 'GPS ready' : 'Searching GPS...'
-      bottom = 'Start = record route'
+      bottom = 'Press Start to record a route'
       break
     case 'tracking':
       top = 'REC ' + fmtTime(recElapsed()) + ' · ' + fmtDist(distance) + gps
-      bottom = 'Start = stop'
+      bottom = 'Recording route...'
       break
     case 'stopped':
       top = 'Stopped · ' + fmtDist(distance)
-      bottom = 'Start = TrackBack\nBack = resume · Hold = new'
+      bottom = 'Go Back to retrace it, or start a New Route'
       break
     case 'backtrack':
       if (arrived) {
         top = 'You are back!'
-        bottom = 'Start = done'
+        bottom = 'Press New Route to walk again'
       } else {
         top = fmtDist(remaining) + ' to start' + gps
         bottom = (offRoute ? 'Off route · ' : '') + turnHint()
@@ -337,6 +424,7 @@ function renderText() {
   }
   topText.setProperty(prop.TEXT, top)
   bottomText.setProperty(prop.TEXT, bottom)
+  headingText.setProperty(prop.TEXT, headingLabel())
 }
 
 function render() {
@@ -348,7 +436,12 @@ function render() {
   }
 }
 
-// ---------- Buttons ----------
+function tick() {
+  blinkTick++
+  render()
+}
+
+// ---------- Actions & buttons ----------
 function startRecording() {
   recStartedAt = Date.now()
   lastAddAt = Date.now()
@@ -361,90 +454,141 @@ function stopRecording() {
   saveRoute()
 }
 function endBacktrack() {
-  safe(() => compass.stop())
   state = 'stopped'
+}
+function onStartPressed() { startRecording(); layoutButtons(); render() }
+function onStopPressed() { stopRecording(); layoutButtons(); render() }
+function onGoBackPressed() { startBacktrack(); layoutButtons(); render() }
+function onStopBacktrackPressed() { endBacktrack(); layoutButtons(); render() }
+function onNewRoutePressed() { clearRoute(); startRecording(); layoutButtons(); render() }
+
+function getButtons() {
+  if (state === 'tracking') return [{ label: 'Stop', action: onStopPressed }]
+  if (state === 'stopped') {
+    return [
+      { label: 'Go Back', action: onGoBackPressed },
+      { label: 'New Route', action: onNewRoutePressed },
+    ]
+  }
+  if (state === 'backtrack') {
+    return arrived
+      ? [{ label: 'New Route', action: onNewRoutePressed }]
+      : [{ label: 'Stop', action: onStopBacktrackPressed }]
+  }
+  return [{ label: 'Start', action: onStartPressed }]
+}
+
+function layoutButtons() {
+  const btns = getButtons()
+  const btnH = Math.round(H * 0.13)
+  const y = H - btnH - Math.round(H * 0.025)
+
+  if (btns.length === 1) {
+    const w = Math.round(W * 0.55)
+    const x = Math.round((W - w) / 2)
+    button1.setProperty(prop.MORE, { x, y, w, h: btnH, text: btns[0].label })
+    button2.setProperty(prop.MORE, { x: 0, y: H + 40, w: 10, h: 10, text: '' })
+    button1Action = btns[0].action
+    button2Action = null
+  } else {
+    const sideMargin = Math.round(W * 0.06)
+    const gap = Math.round(W * 0.03)
+    const w = Math.round((W - sideMargin * 2 - gap) / 2)
+    button1.setProperty(prop.MORE, { x: sideMargin, y, w, h: btnH, text: btns[0].label })
+    button2.setProperty(prop.MORE, { x: sideMargin + w + gap, y, w, h: btnH, text: btns[1].label })
+    button1Action = btns[0].action
+    button2Action = btns[1].action
+  }
 }
 
 function handleKey(key, event) {
   const isStart = START_KEYS.indexOf(key) !== -1
   const isBack = BACK_KEYS.indexOf(key) !== -1
   if (!isStart && !isBack) return false // leave other keys to the system
+  if (event !== KEY_EVENT_CLICK) return true
 
-  if (isStart && event === KEY_EVENT_CLICK) {
-    if (state === 'idle') startRecording()
-    else if (state === 'tracking') stopRecording()
-    else if (state === 'stopped') startBacktrack()
-    else if (state === 'backtrack') endBacktrack()
+  if (isStart) {
+    if (button1Action) button1Action()
+  } else if (isBack) {
+    if (button2Action) button2Action()
+    else if (state === 'idle') { exit(); return true }
   }
-
-  if (isBack && event === KEY_EVENT_CLICK) {
-    if (state === 'idle') { exit(); return true }
-    if (state === 'stopped') startRecording()
-    else if (state === 'backtrack') endBacktrack()
-    // while recording, Back does nothing so you can't quit by accident
-  }
-
-  if (isBack && event === KEY_EVENT_LONG_PRESS && state === 'stopped') {
-    clearRoute()
-    state = 'idle'
-  }
-
-  render()
   return true
 }
 
 // ---------- Page ----------
 Page({
   build() {
-    console.log('[tb] build:start')
     const info = getDeviceInfo()
     W = info.width
     H = info.height
-    console.log('[tb] deviceInfo ' + W + 'x' + H)
-    A = Math.round(Math.min(W, H) * 0.68) // square map that fits a round screen
+    A = Math.round(Math.min(W, H) * 0.55) // leaves room for text above and buttons below
+
+    const topTextY = Math.round(H * 0.035)
+    const topTextH = Math.round(H * 0.09)
+    const hintTextY = topTextY + topTextH + Math.round(H * 0.01)
+    const hintTextH = Math.round(H * 0.075)
+    mapY = hintTextY + hintTextH + Math.round(H * 0.015)
     mapX = Math.round((W - A) / 2)
-    mapY = Math.round((H - A) / 2)
 
     topText = createWidget(widget.TEXT, {
-      x: 0, y: mapY - 48, w: W, h: 44,
+      x: 0, y: topTextY, w: W, h: topTextH,
       text_size: 24, color: 0xffffff,
       align_h: align.CENTER_H, align_v: align.CENTER_V,
       text: '',
     })
-    console.log('[tb] topText created')
-    canvas = createWidget(widget.CANVAS, { x: mapX, y: mapY, w: A, h: A })
-    console.log('[tb] canvas created')
+    headingText = createWidget(widget.TEXT, {
+      x: W - 100, y: 6, w: 92, h: 24,
+      text_size: 15, color: C_TEXT_DIM,
+      align_h: align.CENTER_H, align_v: align.CENTER_V,
+      text: '',
+    })
     bottomText = createWidget(widget.TEXT, {
-      x: Math.round(W * 0.15), y: mapY + A + 2, w: Math.round(W * 0.7), h: 56,
-      text_size: 20, color: C_TEXT_DIM,
+      x: Math.round(W * 0.1), y: hintTextY, w: Math.round(W * 0.8), h: hintTextH,
+      text_size: 18, color: C_TEXT_DIM,
       align_h: align.CENTER_H, align_v: align.TOP,
       text_style: text_style.WRAP,
       text: '',
     })
-    console.log('[tb] bottomText created')
+    canvas = createWidget(widget.CANVAS, { x: mapX, y: mapY, w: A, h: A })
+
+    button1 = createWidget(widget.BUTTON, {
+      x: 0, y: 0, w: 10, h: 10, text: '', text_size: 22,
+      normal_color: 0x2979ff, press_color: 0x1a55cc, radius: 16,
+      click_func: () => { if (button1Action) button1Action() },
+    })
+    button2 = createWidget(widget.BUTTON, {
+      x: 0, y: 0, w: 10, h: 10, text: '', text_size: 22,
+      normal_color: 0x455a64, press_color: 0x2c3a40, radius: 16,
+      click_func: () => { if (button2Action) button2Action() },
+    })
 
     storage = new LocalStorage()
     vibrator = new Vibrator()
     compass = new Compass()
+    compass.onChange(() => {
+      compassCalibrated = !!compass.getStatus()
+      if (compassCalibrated) {
+        const a = compass.getDirectionAngle()
+        if (typeof a === 'number') { compassHeading = a; updateHeading() }
+      }
+    })
+    safe(() => compass.start())
+
     geo = new Geolocation()
     geo.onChange(onGps)
     geo.start()
-    console.log('[tb] sensors/storage ready')
 
     loadRoute()
-    console.log('[tb] loadRoute done, mode=' + state)
+    layoutButtons()
 
     // keep the app on screen while you walk
     safe(() => setPageBrightTime({ brightTime: 60 * 60 * 1000 }))
-    console.log('[tb] setPageBrightTime called')
     safe(() => setWakeUpRelaunch({ relaunch: true }))
-    console.log('[tb] setWakeUpRelaunch called')
 
-    tickTimer = setInterval(renderText, 1000)
+    tickTimer = setInterval(tick, 1000)
     onKey({ callback: handleKey })
-    console.log('[tb] onKey registered')
     render()
-    console.log('[tb] build:end')
   },
 
   onDestroy() {
